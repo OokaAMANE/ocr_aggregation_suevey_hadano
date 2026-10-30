@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import logging
-import os
 import urllib.parse
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -15,57 +13,24 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import aggregate, db, export, images, ocr, surveys
+from . import aggregate, db, export, images, jobs, ocr, surveys
 
 log = logging.getLogger("survey")
 STATIC_DIR = Path(__file__).parent / "static"
 
-_executor = ThreadPoolExecutor(max_workers=int(os.environ.get("OCR_CONCURRENCY", "3")))
+OCR_MODES = ("batch", "now", "none")
 
 
 def _image_dir() -> Path:
     return db.data_dir() / "images"
 
 
-def run_ocr(response_id: int):
-    r = db.get_response(response_id)
-    if not r or r["status"] not in ("queued", "processing"):
-        return
-    db.update_response(response_id, status="processing", error="")
-    try:
-        survey = surveys.get_survey(r["survey_id"])
-        result = ocr.read_form(survey, [_image_dir() / f for f in db.page_files(response_id)])
-    except ocr.OCRError as e:
-        db.update_response(response_id, status="error", error=str(e))
-        return
-    except Exception as e:  # 想定外の失敗でも1件のエラーとして記録し、他の読み取りは続ける
-        log.exception("OCR failed for response %s", response_id)
-        db.update_response(response_id, status="error", error=f"読み取りに失敗しました: {e}")
-        return
-    uncertain = sorted(set(result["uncertain"]) | set(surveys.find_problems(survey, result["answers"])))
-    db.update_response(
-        response_id,
-        answers=result["answers"],
-        uncertain=uncertain,
-        notes=result["notes"],
-        status="review" if uncertain or result["notes"] else "auto",
-    )
-
-
-def enqueue(response_id: int):
-    db.update_response(response_id, status="queued", error="")
-    _executor.submit(run_ocr, response_id)
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init()
-    # 前回の起動中に終わらなかった読み取りを再開する
-    if ocr.available():
-        for rid in db.response_ids_with_status("processing") + db.response_ids_with_status("queued"):
-            enqueue(rid)
+    jobs.start()  # 前回の起動中に終わらなかった読み取りを再開する
     yield
-    _executor.shutdown(wait=False, cancel_futures=True)
+    jobs.stop()
 
 
 app = FastAPI(title="アンケート OCR・集計ツール", lifespan=lifespan)
@@ -116,12 +81,15 @@ async def upload(
     files: list[UploadFile] = File(...),
     batch: str = Form(""),
     pages_per_response: int = Form(1),
-    run_ocr_now: bool = Form(True),
+    ocr_mode: str = Form("batch"),
 ):
+    """ocr_mode: batch=バッチ読み取り（半額）、now=すぐ読み取る、none=読み取らない（手入力）"""
     survey = _survey(survey_id)
     if not 1 <= pages_per_response <= 10:
         raise HTTPException(400, "1人あたりのページ数は1〜10で指定してください")
-    if run_ocr_now and not ocr.available():
+    if ocr_mode not in OCR_MODES:
+        raise HTTPException(400, "読み取り方法が不正です")
+    if ocr_mode != "none" and not ocr.available():
         raise HTTPException(400, "AI読み取りが設定されていません（ANTHROPIC_API_KEY が未設定）")
 
     # 全ファイルをページ画像として保存する（変換は重いので別スレッドで行い、画面の応答を止めない）
@@ -163,16 +131,15 @@ async def upload(
                 if from_one_file
                 else " / ".join(g[0] for g in group)
             )
-            rid = db.create_response(
-                survey_id, batch.strip(), source, "queued" if run_ocr_now else "review",
-                surveys.blank_answers(survey),
-            )
+            rid = db.create_response(survey_id, batch.strip(), source, "review", surveys.blank_answers(survey))
             for page_no, (_, _, fn) in enumerate(group, 1):
                 db.add_page(rid, page_no, fn)
             created.append(rid)
-    if run_ocr_now:
+    if ocr_mode == "batch":
+        jobs.enqueue_batch(created)
+    elif ocr_mode == "now":
         for rid in created:
-            _executor.submit(run_ocr, rid)
+            jobs.enqueue(rid)
     return {"created": created, "pages": total, "warning": "\n".join(warnings)}
 
 
@@ -253,7 +220,7 @@ def rerun_ocr(response_id: int):
         raise HTTPException(400, "AI読み取りが設定されていません")
     if not r["pages"]:
         raise HTTPException(400, "用紙画像がありません")
-    enqueue(response_id)
+    jobs.enqueue(response_id)
     return {"ok": True}
 
 
@@ -268,14 +235,30 @@ def confirm_auto(survey_id: str):
 
 
 @app.post("/api/surveys/{survey_id}/retry-errors")
-def retry_errors(survey_id: str):
+def retry_errors(survey_id: str, mode: str = "batch"):
     _survey(survey_id)
     if not ocr.available():
         raise HTTPException(400, "AI読み取りが設定されていません")
-    rows = [r for r in db.list_responses(survey_id, ["error"]) if r["page_count"]]
-    for r in rows:
-        enqueue(r["id"])
-    return {"queued": len(rows)}
+    ids = [r["id"] for r in db.list_responses(survey_id, ["error"]) if r["page_count"]]
+    if mode == "batch":
+        jobs.enqueue_batch(ids)
+    else:
+        for rid in ids:
+            jobs.enqueue(rid)
+    return {"queued": len(ids)}
+
+
+@app.get("/api/surveys/{survey_id}/batches")
+def list_batches(survey_id: str):
+    _survey(survey_id)
+    return {"batches": db.list_batches(survey_id), "unsent": len(db.unsent_batch_responses())}
+
+
+@app.post("/api/batches/check")
+def check_batches():
+    """バッチの送信・結果確認を今すぐ行う。"""
+    jobs.wake()
+    return {"ok": True}
 
 
 @app.delete("/api/responses/{response_id}")

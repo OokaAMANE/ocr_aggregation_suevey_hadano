@@ -5,7 +5,10 @@ from fastapi.testclient import TestClient
 from openpyxl import load_workbook
 from PIL import Image
 
-from app import aggregate, main, ocr, surveys
+import json
+from types import SimpleNamespace as NS
+
+from app import aggregate, jobs, main, ocr, surveys
 
 
 class InlineExecutor:
@@ -21,7 +24,7 @@ class InlineExecutor:
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     monkeypatch.setenv("SURVEY_DATA_DIR", str(tmp_path))
-    monkeypatch.setattr(main, "_executor", InlineExecutor())
+    monkeypatch.setattr(jobs, "_executor", InlineExecutor())
     with TestClient(main.app) as c:
         yield c
 
@@ -91,7 +94,7 @@ def test_upload_splits_pdf_pages_into_respondents(client):
     res = client.post(
         "/api/surveys/chimura_new/upload",
         files=files,
-        data={"batch": "第1回", "pages_per_response": "2", "run_ocr_now": "false"},
+        data={"batch": "第1回", "pages_per_response": "2", "ocr_mode": "none"},
     )
     assert res.status_code == 200, res.text
     body = res.json()
@@ -114,7 +117,7 @@ def test_upload_groups_pages_within_each_pdf(client):
     body = client.post(
         "/api/surveys/chimura_new/upload",
         files=files,
-        data={"pages_per_response": "2", "run_ocr_now": "false"},
+        data={"pages_per_response": "2", "ocr_mode": "none"},
     ).json()
     assert body["pages"] == 9 and len(body["created"]) == 5
     assert "box01.pdf" in body["warning"] and "box02.pdf" not in body["warning"]
@@ -127,7 +130,7 @@ def test_upload_pairs_single_page_images_in_order(client):
     body = client.post(
         "/api/surveys/chimura_new/upload",
         files=files,
-        data={"pages_per_response": "2", "run_ocr_now": "false"},
+        data={"pages_per_response": "2", "ocr_mode": "none"},
     ).json()
     sources = [client.get(f"/api/responses/{i}").json()["source"] for i in body["created"]]
     assert sources == ["1表.png / 1裏.png", "2表.png / 2裏.png"] and body["warning"] == ""
@@ -138,7 +141,7 @@ def test_upload_rejects_ocr_without_api_key(client, monkeypatch):
     res = client.post(
         "/api/surveys/taxi_oone/upload",
         files=[("files", ("a.png", png(), "image/png"))],
-        data={"run_ocr_now": "true"},
+        data={"ocr_mode": "now"},
     )
     assert res.status_code == 400
 
@@ -156,7 +159,7 @@ def test_ocr_result_sets_status(client, monkeypatch):
     res = client.post(
         "/api/surveys/taxi_oone/upload",
         files=[("files", ("a.png", png(), "image/png"))],
-        data={"run_ocr_now": "true"},
+        data={"ocr_mode": "now"},
     ).json()
     r = client.get(f"/api/responses/{res['created'][0]}").json()
     assert r["status"] == "auto"
@@ -253,9 +256,110 @@ def test_confirm_auto_and_delete(client, monkeypatch):
     created = client.post(
         "/api/surveys/taxi_minami/upload",
         files=[("files", ("a.png", png(), "image/png")), ("files", ("b.png", png(), "image/png"))],
-        data={"run_ocr_now": "true"},
+        data={"ocr_mode": "now"},
     ).json()["created"]
     assert client.post("/api/surveys/taxi_minami/confirm-auto").json() == {"confirmed": 2}
     assert client.delete(f"/api/responses/{created[0]}").json() == {"ok": True}
     counts = client.get("/api/surveys/taxi_minami/responses").json()["counts"]
     assert counts["confirmed"] == 1
+
+
+# ---------------------------------------------------------------- バッチ読み取り
+
+
+class FakeBatchAPI:
+    """client.messages.batches の代わり。送信内容を記録し、指定した結果を返す。"""
+
+    def __init__(self):
+        self.created: dict[str, list[dict]] = {}
+        self.ended: set[str] = set()
+        self.results_by_id: dict[str, dict] = {}  # custom_id -> 結果
+
+    def create(self, requests):
+        bid = f"msgbatch_{len(self.created) + 1}"
+        self.created[bid] = list(requests)
+        return NS(id=bid)
+
+    def retrieve(self, bid):
+        n = len(self.created[bid])
+        done = bid in self.ended
+        return NS(
+            processing_status="ended" if done else "in_progress",
+            request_counts=NS(processing=0 if done else n, succeeded=n if done else 0, errored=0, canceled=0, expired=0),
+        )
+
+    def results(self, bid):
+        for req in self.created[bid]:
+            cid = req["custom_id"]
+            if cid in self.results_by_id:
+                yield NS(custom_id=cid, result=self.results_by_id[cid])
+
+
+def ok_result(survey_id, **answers):
+    data = {"answers": answers_for(survey_id, **answers), "uncertain": [], "notes": ""}
+    msg = NS(stop_reason="end_turn", content=[NS(type="text", text=json.dumps(data, ensure_ascii=False))])
+    return NS(type="succeeded", message=msg)
+
+
+@pytest.fixture
+def fake_batches(monkeypatch):
+    api = FakeBatchAPI()
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    monkeypatch.setattr(ocr, "_get_client", lambda: NS(messages=NS(batches=api)))
+    return api
+
+
+def test_batch_ocr_submits_polls_and_stores_results(client, fake_batches, monkeypatch):
+    sid = "taxi_minami"
+    created = client.post(
+        f"/api/surveys/{sid}/upload",
+        files=[("files", (f"{i}.png", png(), "image/png")) for i in range(3)],
+        data={"ocr_mode": "batch"},
+    ).json()["created"]
+    assert client.get(f"/api/surveys/{sid}/responses").json()["counts"]["batch"] == 3
+
+    jobs.submit_pending()
+    (bid, reqs), = fake_batches.created.items()
+    assert [r["custom_id"] for r in reqs] == [f"r{i}" for i in created]
+    params = reqs[0]["params"]
+    assert params["output_config"]["format"]["type"] == "json_schema"
+    assert "fallbacks" not in params  # バッチでは使えない
+    assert [c["type"] for c in params["messages"][0]["content"]] == ["text", "image", "text"]
+    jobs.submit_pending()  # 送信済みのものは二重に送らない
+    assert len(fake_batches.created) == 1
+
+    jobs.poll_batches()  # まだ処理中
+    assert client.get(f"/api/surveys/{sid}/batches").json()["batches"][0]["processing"] == 3
+
+    # 1件目は成功、2件目は失敗、3件目は結果待ちの間に通常読み取りでやり直された
+    fake_batches.results_by_id = {
+        f"r{created[0]}": ok_result(sid, gender=sel("女性")),
+        f"r{created[1]}": NS(type="errored", error=NS(error=NS(type="overloaded_error", message="Overloaded"))),
+        f"r{created[2]}": ok_result(sid, gender=sel("男性")),
+    }
+    monkeypatch.setattr(ocr, "read_form", lambda s, p: {"answers": answers_for(s["id"]), "uncertain": ["q1"], "notes": ""})
+    client.post(f"/api/responses/{created[2]}/ocr")
+    fake_batches.ended.add(bid)
+    jobs.poll_batches()
+
+    r0, r1, r2 = (client.get(f"/api/responses/{i}").json() for i in created)
+    assert r0["status"] == "auto" and r0["answers"]["gender"]["selected"] == ["女性"]
+    assert r1["status"] == "error" and "Overloaded" in r1["error"]
+    assert r2["status"] == "review" and r2["answers"]["gender"]["selected"] == []  # 古いバッチ結果で上書きしない
+    assert client.get(f"/api/surveys/{sid}/batches").json()["batches"][0]["status"] == "ended"
+
+    # エラーはバッチで再読み取りできる
+    assert client.post(f"/api/surveys/{sid}/retry-errors?mode=batch").json() == {"queued": 1}
+    jobs.submit_pending()
+    assert len(fake_batches.created) == 2
+
+
+def test_batch_is_split_by_size(client, fake_batches, monkeypatch):
+    monkeypatch.setattr(jobs, "MAX_BATCH_BYTES", 1)  # 1件ずつ別のバッチになる大きさ
+    client.post(
+        "/api/surveys/taxi_minami/upload",
+        files=[("files", (f"{i}.png", png(), "image/png")) for i in range(3)],
+        data={"ocr_mode": "batch"},
+    )
+    jobs.submit_pending()
+    assert [len(r) for r in fake_batches.created.values()] == [1, 1, 1]

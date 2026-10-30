@@ -11,13 +11,14 @@ from datetime import datetime
 from pathlib import Path
 
 # 状態の意味
+#   batch       : バッチ読み取り中（半額。結果は通常1時間以内、最大24時間）
 #   queued      : AI読み取り待ち
 #   processing  : AI読み取り中
 #   auto        : AI読み取り済み（気になる点なし・未確認）
 #   review      : 要確認（AIが自信なし、または単一回答に複数チェック等）
 #   confirmed   : 担当者が確認済み
 #   error       : 読み取り失敗
-STATUSES = ["queued", "processing", "auto", "review", "confirmed", "error"]
+STATUSES = ["batch", "queued", "processing", "auto", "review", "confirmed", "error"]
 COUNTABLE = ("auto", "review", "confirmed")
 
 _lock = threading.Lock()
@@ -71,8 +72,23 @@ def init():
                 filename    TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_pages_response ON pages(response_id);
+            CREATE TABLE IF NOT EXISTS ocr_batches (
+                id          TEXT PRIMARY KEY,
+                survey_id   TEXT NOT NULL,
+                status      TEXT NOT NULL,
+                total       INTEGER NOT NULL,
+                succeeded   INTEGER NOT NULL DEFAULT 0,
+                errored     INTEGER NOT NULL DEFAULT 0,
+                processing  INTEGER NOT NULL DEFAULT 0,
+                created_at  TEXT NOT NULL,
+                ended_at    TEXT NOT NULL DEFAULT ''
+            );
             """
         )
+        cols = {r[1] for r in c.execute("PRAGMA table_info(responses)")}
+        if "ocr_batch" not in cols:
+            # バッチ読み取りで送信済みのバッチID（未送信は空文字）
+            c.execute("ALTER TABLE responses ADD COLUMN ocr_batch TEXT NOT NULL DEFAULT ''")
 
 
 def _now() -> str:
@@ -207,3 +223,60 @@ def next_to_review(survey_id: str, after_id: int) -> int | None:
             if r:
                 return r[0]
     return None
+
+
+# ---------------------------------------------------------------- バッチ読み取り
+
+
+def unsent_batch_responses() -> list[int]:
+    """バッチ読み取り待ちのうち、まだ API に送信していない回答。"""
+    with connect() as c:
+        return [
+            r[0]
+            for r in c.execute("SELECT id FROM responses WHERE status = 'batch' AND ocr_batch = '' ORDER BY id")
+        ]
+
+
+def add_batch(batch_id: str, survey_id: str, response_ids: list[int]):
+    with connect() as c:
+        c.execute(
+            "INSERT INTO ocr_batches (id, survey_id, status, total, processing, created_at)"
+            " VALUES (?, ?, 'in_progress', ?, ?, ?)",
+            (batch_id, survey_id, len(response_ids), len(response_ids), _now()),
+        )
+        c.executemany(
+            "UPDATE responses SET ocr_batch = ? WHERE id = ?", [(batch_id, rid) for rid in response_ids]
+        )
+
+
+def update_batch(batch_id: str, **fields):
+    cols = ", ".join(f"{k} = ?" for k in fields)
+    with connect() as c:
+        c.execute(f"UPDATE ocr_batches SET {cols} WHERE id = ?", (*fields.values(), batch_id))
+
+
+def open_batches() -> list[dict]:
+    with connect() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM ocr_batches WHERE status = 'in_progress' ORDER BY created_at")]
+
+
+def list_batches(survey_id: str, limit: int = 10) -> list[dict]:
+    with connect() as c:
+        return [
+            dict(r)
+            for r in c.execute(
+                "SELECT * FROM ocr_batches WHERE survey_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                (survey_id, limit),
+            )
+        ]
+
+
+def batch_response_ids(batch_id: str) -> set[int]:
+    """そのバッチの結果を待っている回答（途中で削除・再読み取りされたものは除く）。"""
+    with connect() as c:
+        return {
+            r[0]
+            for r in c.execute(
+                "SELECT id FROM responses WHERE ocr_batch = ? AND status = 'batch'", (batch_id,)
+            )
+        }

@@ -13,6 +13,7 @@ from . import aggregate
 from .surveys import CHOICE_TYPES
 
 STATUS_LABELS = {
+    "batch": "バッチ読取中",
     "queued": "読取待ち",
     "processing": "読取中",
     "auto": "読取済（未確認）",

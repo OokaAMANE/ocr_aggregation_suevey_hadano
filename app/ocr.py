@@ -52,8 +52,8 @@ def _get_client() -> anthropic.Anthropic:
     return _client
 
 
-def read_form(survey: dict, page_paths: list[Path]) -> dict:
-    """用紙画像を読み取り {"answers", "uncertain", "notes"} を返す。answers は正規化済み。"""
+def request_params(survey: dict, page_paths: list[Path]) -> dict:
+    """読み取り1件分の Messages API パラメータ（通常の読み取りとバッチ読み取りで共通）。"""
     content: list[dict] = []
     for i, path in enumerate(page_paths, 1):
         content.append({"type": "text", "text": f"{i}ページ目:"})
@@ -68,44 +68,31 @@ def read_form(survey: dict, page_paths: list[Path]) -> dict:
             }
         )
     content.append({"type": "text", "text": "この用紙の回答を、指定の JSON 形式で読み取ってください。"})
+    return {
+        "model": MODEL,
+        "max_tokens": 16000,
+        "system": [
+            {
+                "type": "text",
+                "text": SYSTEM_PROMPT + surveys.describe_survey(survey),
+                "cache_control": {"type": "ephemeral"},
+            }
+        ],
+        "messages": [{"role": "user", "content": content}],
+        "output_config": {
+            "effort": EFFORT,
+            "format": {"type": "json_schema", "schema": surveys.ocr_schema(survey)},
+        },
+    }
 
-    extra: dict = {}
-    if MODEL in FALLBACK_MODELS:
-        extra = {"betas": ["server-side-fallback-2026-07-01"], "fallbacks": "default"}
-    try:
-        resp = _get_client().beta.messages.create(
-            model=MODEL,
-            max_tokens=16000,
-            **extra,
-            system=[
-                {
-                    "type": "text",
-                    "text": SYSTEM_PROMPT + surveys.describe_survey(survey),
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ],
-            messages=[{"role": "user", "content": content}],
-            output_config={
-                "effort": EFFORT,
-                "format": {"type": "json_schema", "schema": surveys.ocr_schema(survey)},
-            },
-        )
-    except anthropic.AuthenticationError as e:
-        raise OCRError("APIキーが無効です。ANTHROPIC_API_KEY を確認してください。") from e
-    except anthropic.RateLimitError as e:
-        raise OCRError("API の利用上限に達しました。しばらくしてから再読み取りしてください。") from e
-    except anthropic.BadRequestError as e:
-        raise OCRError(f"API リクエストエラー: {e.message}") from e
-    except anthropic.APIStatusError as e:
-        raise OCRError(f"API エラー（{e.status_code}）: {e.message}") from e
-    except anthropic.APIConnectionError as e:
-        raise OCRError("API に接続できません。ネットワークを確認してください。") from e
 
-    if resp.stop_reason == "refusal":
-        raise OCRError("AI が読み取りを辞退しました。手入力してください。")
-    if resp.stop_reason == "max_tokens":
+def parse_message(survey: dict, msg) -> dict:
+    """API の応答メッセージを {"answers", "uncertain", "notes"} にする。answers は正規化済み。"""
+    if msg.stop_reason == "refusal":
+        raise OCRError("AI が読み取りを辞退しました。再読み取りするか、手入力してください。")
+    if msg.stop_reason == "max_tokens":
         raise OCRError("読み取り結果が長すぎて途中で切れました。再読み取りしてください。")
-    text = next((b.text for b in resp.content if b.type == "text"), None)
+    text = next((b.text for b in msg.content if b.type == "text"), None)
     if not text:
         raise OCRError("AI から読み取り結果が返りませんでした。")
     try:
@@ -119,3 +106,30 @@ def read_form(survey: dict, page_paths: list[Path]) -> dict:
         "uncertain": [q for q in data.get("uncertain") or [] if q in qids],
         "notes": str(data.get("notes") or "").strip(),
     }
+
+
+def api_error_message(e: anthropic.APIError) -> str:
+    if isinstance(e, anthropic.AuthenticationError):
+        return "APIキーが無効です。ANTHROPIC_API_KEY を確認してください。"
+    if isinstance(e, anthropic.RateLimitError):
+        return "API の利用上限に達しました。しばらくしてから再読み取りしてください。"
+    if isinstance(e, anthropic.BadRequestError):
+        return f"API リクエストエラー: {e.message}"
+    if isinstance(e, anthropic.APIStatusError):
+        return f"API エラー（{e.status_code}）: {e.message}"
+    if isinstance(e, anthropic.APIConnectionError):
+        return "API に接続できません。ネットワークを確認してください。"
+    return f"API エラー: {e}"
+
+
+def read_form(survey: dict, page_paths: list[Path]) -> dict:
+    """用紙画像をその場で読み取る（通常料金）。"""
+    params = request_params(survey, page_paths)
+    if MODEL in FALLBACK_MODELS:
+        # 安全フィルタで断られた場合は、サーバー側で推奨モデルに自動で切り替えて再実行する
+        params.update(betas=["server-side-fallback-2026-07-01"], fallbacks="default")
+    try:
+        resp = _get_client().beta.messages.create(**params)
+    except anthropic.APIError as e:
+        raise OCRError(api_error_message(e)) from e
+    return parse_message(survey, resp)

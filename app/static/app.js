@@ -1,6 +1,7 @@
 "use strict";
 
 const STATUS = {
+  batch: "バッチ読取中",
   queued: "読取待ち",
   processing: "読取中",
   auto: "読取済（未確認）",
@@ -112,6 +113,7 @@ function route() {
 function renderImport(view) {
   const s = state.surveys.find((x) => x.id === state.surveyId);
   const ocrOk = state.config.ocr_available;
+  const mode = ocrOk ? load("ocrMode") || "batch" : "none";
   view.innerHTML = `
     <h2>用紙の取り込み</h2>
     <div class="panel">
@@ -132,12 +134,20 @@ function renderImport(view) {
         <label class="field">1人あたりのページ数
           <select id="ppr">${[1, 2, 3, 4].map((n) => `<option ${n === s.default_pages ? "selected" : ""}>${n}</option>`).join("")}</select>
         </label>
-        <label class="row" style="gap:6px; font-size:14px">
-          <input type="checkbox" id="run-ocr" ${ocrOk ? "checked" : "disabled"}> AIで手書きを読み取る
-        </label>
         <span class="spacer"></span>
         <button class="btn primary" id="go" disabled>取り込み開始</button>
       </div>
+      <fieldset class="modes">
+        <legend>AIによる読み取り</legend>
+        ${[
+          ["batch", "バッチで読み取る（おすすめ）", "料金が半額。結果は通常1時間以内（最大24時間）に届き、届いた分から一覧に反映されます。"],
+          ["now", "すぐに読み取る", "通常料金。1枚あたり数十秒で結果が出ます。少数の試し読みや急ぐとき向け。"],
+          ["none", "読み取らない", "画像だけ取り込み、画面から手入力します。"],
+        ].map(([v, label, desc]) => `
+          <label class="mode"><input type="radio" name="ocr-mode" value="${v}"
+            ${v !== "none" && !ocrOk ? "disabled" : ""} ${v === mode ? "checked" : ""}>
+            <span><strong>${label}</strong><br><span class="muted">${desc}</span></span></label>`).join("")}
+      </fieldset>
     </div>
     <div class="panel">
       <h3>用紙がない回答（Web回答・電話聞き取りなど）</h3>
@@ -166,8 +176,10 @@ function renderImport(view) {
     files.forEach((f) => fd.append("files", f));
     fd.append("batch", $("#batch").value);
     fd.append("pages_per_response", $("#ppr").value);
-    fd.append("run_ocr_now", $("#run-ocr").checked ? "true" : "false");
+    const ocrMode = $("input[name=ocr-mode]:checked").value;
+    fd.append("ocr_mode", ocrMode);
     store("batch", $("#batch").value);
+    if (ocrMode !== "none") store("ocrMode", ocrMode);
     go.disabled = true;
     go.textContent = "取り込み中…";
     try {
@@ -191,7 +203,10 @@ function renderImport(view) {
 // ---------------------------------------------------------------- ② 回答一覧
 
 async function renderList(view) {
-  const data = await api(`/api/surveys/${state.surveyId}/responses?status=${state.listFilter}`);
+  const [data, batches] = await Promise.all([
+    api(`/api/surveys/${state.surveyId}/responses?status=${state.listFilter}`),
+    api(`/api/surveys/${state.surveyId}/batches`),
+  ]);
   const c = data.counts;
   const total = Object.values(c).reduce((a, b) => a + b, 0);
   const attrQs = state.survey.questions.filter((q) => q.attribute);
@@ -203,8 +218,9 @@ async function renderList(view) {
       <span class="spacer"></span>
       ${c.review + c.auto ? `<a class="btn primary" href="#/review/${firstToReview(data.responses)}">未確認の回答を順に確認</a>` : ""}
       ${c.auto ? `<button class="btn" id="confirm-auto">読取済（未確認）${c.auto}件を一括で確認済にする</button>` : ""}
-      ${c.error && state.config.ocr_available ? `<button class="btn" id="retry">エラー${c.error}件を再読み取り</button>` : ""}
+      ${c.error && state.config.ocr_available ? `<button class="btn" id="retry">エラー${c.error}件をバッチで再読み取り</button>` : ""}
     </div>
+    ${renderBatches(batches, c.batch)}
     <div class="panel">
       <div class="chips" style="margin-bottom:12px">
         ${filters.map(([k, label]) => `<button class="chip ${state.listFilter === k ? "on" : ""}" data-f="${k}">${esc(label)}</button>`).join("")}
@@ -235,14 +251,41 @@ async function renderList(view) {
     renderList(view);
   });
   $("#retry")?.addEventListener("click", async () => {
-    const res = await api(`/api/surveys/${state.surveyId}/retry-errors`, { method: "POST" });
-    toast(`${res.queued}件を再読み取りします`);
+    const res = await api(`/api/surveys/${state.surveyId}/retry-errors?mode=batch`, { method: "POST" });
+    toast(`${res.queued}件をバッチで再読み取りします`);
     renderList(view);
   });
+  $("#check-batches")?.addEventListener("click", async () => {
+    await api("/api/batches/check", { method: "POST" });
+    toast("結果を確認しています…");
+    setTimeout(() => location.hash.startsWith("#/list") && renderList(view), 4000);
+  });
 
-  if (c.queued + c.processing > 0) {
-    pollTimer = setTimeout(() => location.hash.startsWith("#/list") && renderList(view), 3000);
-  }
+  // 読み取り中は自動で表示を更新する（バッチは結果が届くまで時間がかかるので間隔を長めに）
+  const wait = c.queued + c.processing > 0 ? 3000 : c.batch > 0 ? 30000 : 0;
+  if (wait) pollTimer = setTimeout(() => location.hash.startsWith("#/list") && renderList(view), wait);
+}
+
+function renderBatches(data, waiting) {
+  const active = data.batches.filter((b) => b.status === "in_progress");
+  if (!waiting && !active.length) return "";
+  const fmt = (t) => (t ? t.replace("T", " ").slice(5, 16) : "");
+  return `<div class="panel">
+    <div class="row" style="margin-bottom:8px">
+      <h3 style="margin:0">バッチ読み取りの状況</h3>
+      <span class="muted">結果は自動で確認しています（1分ごと）。通常1時間以内、最大24時間で届きます。</span>
+      <span class="spacer"></span>
+      <button class="btn small" id="check-batches">今すぐ確認</button>
+    </div>
+    ${data.unsent ? `<p class="muted" style="margin:0 0 6px">送信準備中: ${data.unsent}件</p>` : ""}
+    ${data.batches.length ? `<div class="table-wrap"><table class="list">
+      <thead><tr><th>送信日時</th><th>件数</th><th>状況</th><th>完了</th><th>失敗</th></tr></thead>
+      <tbody>${data.batches.map((b) => `<tr>
+        <td>${esc(fmt(b.created_at))}</td><td>${b.total}</td>
+        <td>${b.status === "ended" ? `<span class="badge st-confirmed">受け取り済</span>` : `<span class="badge st-batch">処理中（残り ${b.processing}件）</span>`}</td>
+        <td>${b.succeeded}</td><td>${b.errored || ""}</td></tr>`).join("")}
+      </tbody></table></div>` : ""}
+  </div>`;
 }
 
 function firstToReview(rows) {
@@ -264,7 +307,7 @@ async function renderReview(view, id) {
     $("#survey-select").value = r.survey_id;
     await loadSurvey();
   }
-  const busy = r.status === "queued" || r.status === "processing";
+  const busy = ["batch", "queued", "processing"].includes(r.status);
   const zoom = Number(load("zoom") || 100);
 
   view.innerHTML = `
@@ -290,7 +333,9 @@ async function renderReview(view, id) {
         </div>
       </section>
       <section>
-        ${busy ? `<div class="notes">AIが読み取り中です。完了すると自動で表示が更新されます。</div>` : ""}
+        ${busy ? `<div class="notes">${r.status === "batch"
+          ? "バッチで読み取り中です（通常1時間以内）。結果が届くと一覧に反映されます。"
+          : "AIが読み取り中です。完了すると自動で表示が更新されます。"}</div>` : ""}
         ${r.error ? `<div class="error-box">${esc(r.error)}</div>` : ""}
         ${r.notes ? `<div class="notes">AIからのメモ: ${esc(r.notes)}</div>` : ""}
         <form id="form">${state.survey.questions.map((q) => renderQuestion(q, r.answers[q.id], r.uncertain.includes(q.id))).join("")}</form>
@@ -358,7 +403,7 @@ async function renderReview(view, id) {
     if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && !busy) { e.preventDefault(); confirmNext(); }
   };
 
-  if (busy) pollTimer = setTimeout(() => location.hash === `#/review/${id}` && renderReview(view, id), 3000);
+  if (busy) pollTimer = setTimeout(() => location.hash === `#/review/${id}` && renderReview(view, id), r.status === "batch" ? 30000 : 3000);
 }
 
 function renderQuestion(q, a, uncertain) {
