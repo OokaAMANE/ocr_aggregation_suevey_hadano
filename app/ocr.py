@@ -14,6 +14,9 @@ from . import images, surveys
 MODEL = os.environ.get("OCR_MODEL", "claude-opus-5-5")
 EFFORT = os.environ.get("OCR_EFFORT", "high")
 
+# 安全フィルタで断られたとき、サーバー側で推奨モデルに切り替えて再実行できるモデル
+FALLBACK_MODELS = {"claude-opus-5-5", "claude-opus-5", "claude-fable-5-1", "claude-sonnet-5-5"}
+
 SYSTEM_PROMPT = """あなたは自治体が実施した紙のアンケートの回答を、手書き用紙の画像からデータ化する担当者です。
 画像は1人分の回答用紙（1〜複数ページ）です。印刷された設問文・選択肢・記入例は回答ではありません。回答者が書き込んだ内容だけを読み取ってください。
 
@@ -66,13 +69,14 @@ def read_form(survey: dict, page_paths: list[Path]) -> dict:
         )
     content.append({"type": "text", "text": "この用紙の回答を、指定の JSON 形式で読み取ってください。"})
 
+    extra: dict = {}
+    if MODEL in FALLBACK_MODELS:
+        extra = {"betas": ["server-side-fallback-2026-07-01"], "fallbacks": "default"}
     try:
         resp = _get_client().beta.messages.create(
             model=MODEL,
             max_tokens=16000,
-            # 安全フィルタで断られた場合は、サーバー側で推奨モデルに自動で切り替えて再実行する
-            betas=["server-side-fallback-2026-07-01"],
-            fallbacks="default",
+            **extra,
             system=[
                 {
                     "type": "text",
