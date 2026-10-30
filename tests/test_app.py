@@ -105,6 +105,34 @@ def test_upload_splits_pdf_pages_into_respondents(client):
     assert img.status_code == 200 and img.headers["content-type"] == "image/jpeg"
 
 
+def test_upload_groups_pages_within_each_pdf(client):
+    # 1つ目の PDF は1ページ抜けている。2つ目の PDF の区切りはずれない
+    files = [
+        ("files", ("box01.pdf", pdf(5), "application/pdf")),
+        ("files", ("box02.pdf", pdf(4), "application/pdf")),
+    ]
+    body = client.post(
+        "/api/surveys/chimura_new/upload",
+        files=files,
+        data={"pages_per_response": "2", "run_ocr_now": "false"},
+    ).json()
+    assert body["pages"] == 9 and len(body["created"]) == 5
+    assert "box01.pdf" in body["warning"] and "box02.pdf" not in body["warning"]
+    sources = [client.get(f"/api/responses/{i}").json()["source"] for i in body["created"]]
+    assert sources == ["box01.pdf p.1,2", "box01.pdf p.3,4", "box01.pdf p.5", "box02.pdf p.1,2", "box02.pdf p.3,4"]
+
+
+def test_upload_pairs_single_page_images_in_order(client):
+    files = [("files", (n, png(), "image/png")) for n in ("1表.png", "1裏.png", "2表.png", "2裏.png")]
+    body = client.post(
+        "/api/surveys/chimura_new/upload",
+        files=files,
+        data={"pages_per_response": "2", "run_ocr_now": "false"},
+    ).json()
+    sources = [client.get(f"/api/responses/{i}").json()["source"] for i in body["created"]]
+    assert sources == ["1表.png / 1裏.png", "2表.png / 2裏.png"] and body["warning"] == ""
+
+
 def test_upload_rejects_ocr_without_api_key(client, monkeypatch):
     monkeypatch.setattr(ocr, "available", lambda: False)
     res = client.post(

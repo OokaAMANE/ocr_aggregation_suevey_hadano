@@ -148,7 +148,7 @@ table.list tr.clickable:hover td { background: #f7f9fc; }
 .texts li .id { color: var(--muted); font-size: 12px; margin-right: 6px; }
 .other-texts { margin-top: 10px; font-size: 13px; color: var(--muted); }
 
-.toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: #1f2933; color: #fff; padding: 10px 18px; border-radius: 8px; z-index: 50; max-width: 90vw; }
+.toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: #1f2933; color: #fff; padding: 10px 18px; border-radius: 8px; z-index: 50; max-width: 90vw; white-space: pre-wrap; }
 .toast.bad { background: var(--bad); }
 
 @media (max-width: 900px) {

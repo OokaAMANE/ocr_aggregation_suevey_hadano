@@ -5,12 +5,12 @@ from __future__ import annotations
 import logging
 import os
 import urllib.parse
-from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -124,40 +124,68 @@ async def upload(
     if run_ocr_now and not ocr.available():
         raise HTTPException(400, "AI読み取りが設定されていません（ANTHROPIC_API_KEY が未設定）")
 
-    # 全ファイルをページに分解し、先頭から pages_per_response 枚ずつを1人分とする
-    pages: list[tuple[str, int, object]] = []  # (ファイル名, ファイル内のページ番号, 画像)
-    for f in files:
-        data = await f.read()
-        try:
-            for i, im in enumerate(images.split_pages(f.filename or "", data), 1):
-                pages.append((f.filename or "", i, im))
-        except Exception:
-            raise HTTPException(400, f"画像として読み込めないファイルです: {f.filename}")
-    if not pages:
+    # 全ファイルをページ画像として保存する（変換は重いので別スレッドで行い、画面の応答を止めない）
+    saved: list[list[tuple[str, int, str]]] = []  # ファイルごとの [(ファイル名, ページ番号, 保存名)]
+    try:
+        for f in files:
+            data = await f.read()
+            name = f.filename or ""
+            try:
+                saved.append(await run_in_threadpool(_save_file_pages, name, data))
+            except Exception:
+                raise HTTPException(400, f"画像として読み込めないファイルです: {name}")
+    except HTTPException:
+        for pages in saved:
+            for _, _, fn in pages:
+                (_image_dir() / fn).unlink(missing_ok=True)
+        raise
+    total = sum(len(p) for p in saved)
+    if not total:
         raise HTTPException(400, "ページがありません")
 
-    pages_in_file = Counter(p[0] for p in pages)
-    created = []
-    for start in range(0, len(pages), pages_per_response):
-        group = pages[start : start + pages_per_response]
-        names = list(dict.fromkeys(g[0] for g in group))
-        source = " / ".join(
-            n if pages_in_file[n] == 1 else f"{n} p.{','.join(str(g[1]) for g in group if g[0] == n)}"
-            for n in names
-        )
-        rid = db.create_response(
-            survey_id, batch.strip(), source, "queued" if run_ocr_now else "review", surveys.blank_answers(survey)
-        )
-        for page_no, (_, _, im) in enumerate(group, 1):
-            db.add_page(rid, page_no, images.save_page(im, _image_dir()))
-        created.append(rid)
+    # 複数ページのファイル（PDF など）はファイルの中だけで pages_per_response 枚ずつ区切る。
+    # 1ページだけの画像ファイルは、選んだ順に続けて区切る（表・裏を別ファイルにした場合）。
+    singles = [p[0] for p in saved if len(p) == 1]
+    chunks = [(p, True) for p in saved if len(p) > 1] + ([(singles, False)] if singles else [])
+
+    created, warnings = [], []
+    for pages, from_one_file in chunks:
+        if len(pages) % pages_per_response:
+            label = pages[0][0] if from_one_file else "1ページの画像ファイル"
+            warnings.append(
+                f"{label}: {len(pages)}ページは1人あたり{pages_per_response}ページで割り切れません。"
+                "ページの抜け・重複がないか確認してください。"
+            )
+        for start in range(0, len(pages), pages_per_response):
+            group = pages[start : start + pages_per_response]
+            source = (
+                f"{group[0][0]} p.{','.join(str(g[1]) for g in group)}"
+                if from_one_file
+                else " / ".join(g[0] for g in group)
+            )
+            rid = db.create_response(
+                survey_id, batch.strip(), source, "queued" if run_ocr_now else "review",
+                surveys.blank_answers(survey),
+            )
+            for page_no, (_, _, fn) in enumerate(group, 1):
+                db.add_page(rid, page_no, fn)
+            created.append(rid)
     if run_ocr_now:
         for rid in created:
             _executor.submit(run_ocr, rid)
-    warning = ""
-    if len(pages) % pages_per_response:
-        warning = f"ページ数（{len(pages)}）が1人あたりのページ数で割り切れません。最後の1件を確認してください。"
-    return {"created": created, "pages": len(pages), "warning": warning}
+    return {"created": created, "pages": total, "warning": "\n".join(warnings)}
+
+
+def _save_file_pages(name: str, data: bytes) -> list[tuple[str, int, str]]:
+    out = []
+    try:
+        for i, im in enumerate(images.iter_pages(name, data), 1):
+            out.append((name, i, images.save_page(im, _image_dir())))
+    except Exception:
+        for _, _, fn in out:
+            (_image_dir() / fn).unlink(missing_ok=True)
+        raise
+    return out
 
 
 @app.post("/api/surveys/{survey_id}/responses")

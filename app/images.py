@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import uuid
 from pathlib import Path
+from typing import Iterator
 
 from PIL import Image, ImageOps, ImageSequence
 
@@ -27,18 +28,28 @@ def _shrink(im: Image.Image, max_edge: int) -> Image.Image:
     return im
 
 
-def split_pages(filename: str, data: bytes) -> list[Image.Image]:
-    """1ファイルをページ画像のリストにする。PDF・複数ページ TIFF に対応。"""
+def iter_pages(filename: str, data: bytes) -> Iterator[Image.Image]:
+    """1ファイルのページ画像を1枚ずつ返す。PDF・複数ページ TIFF に対応。
+
+    数十ページの PDF でもメモリを使い切らないよう、全ページを一度に展開しない。
+    """
     if filename.lower().endswith(".pdf") or data[:5] == b"%PDF-":
         import pypdfium2 as pdfium
 
         pdf = pdfium.PdfDocument(data)
         try:
-            return [_to_rgb(page.render(scale=PDF_DPI / 72).to_pil()) for page in pdf]
+            for i in range(len(pdf)):
+                page = pdf[i]
+                try:
+                    yield _to_rgb(page.render(scale=PDF_DPI / 72).to_pil())
+                finally:
+                    page.close()
         finally:
             pdf.close()
-    im = Image.open(io.BytesIO(data))
-    return [_to_rgb(frame.copy()) for frame in ImageSequence.Iterator(im)]
+        return
+    with Image.open(io.BytesIO(data)) as im:
+        for frame in ImageSequence.Iterator(im):
+            yield _to_rgb(frame.copy())
 
 
 def save_page(im: Image.Image, image_dir: Path) -> str:
