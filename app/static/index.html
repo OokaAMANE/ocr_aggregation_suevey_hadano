@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>アンケート集計ツール</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">アンケート OCR・集計</div>
+    <label class="survey-pick">
+      <span>様式</span>
+      <select id="survey-select"></select>
+    </label>
+    <nav class="tabs">
+      <a href="#/import" data-tab="import">① 取り込み</a>
+      <a href="#/list" data-tab="list">② 回答一覧・確認</a>
+      <a href="#/summary" data-tab="summary">③ 集計・出力</a>
+    </nav>
+  </header>
+  <div id="ocr-warning" class="banner" hidden>
+    AI読み取りが無効です（環境変数 <code>ANTHROPIC_API_KEY</code> が未設定）。画像の取り込みと手入力・集計は利用できます。
+  </div>
+  <main id="view"></main>
+  <div id="toast" class="toast" hidden></div>
+  <script src="app.js"></script>
+</body>
+</html>
