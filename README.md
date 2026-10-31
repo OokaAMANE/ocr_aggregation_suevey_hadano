@@ -59,13 +59,13 @@ Python 3.10 以上が必要です。
 pip install -r requirements.txt
 ```
 
-AI 読み取りを使うには Anthropic の API キーを環境変数に設定します（未設定でも、取り込み・手入力・集計は使えます）。
+AI 読み取りを使うには Anthropic の API キーを設定します（未設定でも、取り込み・手入力・集計は使えます）。
+いちばん簡単なのは、`.env.example` を `.env` という名前でコピーし、`ANTHROPIC_API_KEY=` の後ろにキーを書く方法です
+（`start.bat` と同じフォルダに置きます。キーを含むので共有しないでください）。環境変数 `ANTHROPIC_API_KEY` で設定しても構いません。
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
 ```
-
-Windows（コマンドプロンプト）の場合は `set ANTHROPIC_API_KEY=sk-ant-...` です。
 
 起動（Windows は `start.bat` をダブルクリック）:
 
@@ -86,6 +86,8 @@ Windows（コマンドプロンプト）の場合は `set ANTHROPIC_API_KEY=sk-a
 | `OCR_BATCH_POLL_SECONDS` | `60` | バッチの結果を確認する間隔（秒） |
 | `OCR_BATCH_MAX_MB` | `100` | 1回のバッチ送信の大きさの上限（API の上限は 256MB）。超える分は自動で分けて送る |
 | `SURVEY_DATA_DIR` | `./data` | 回答データ（SQLite）と用紙画像の保存先 |
+
+これらの設定は `.env` に `変数名=値` の形で書いても有効です（環境変数が設定されていればそちらが優先）。
 
 AI がまれに安全フィルタで読み取りを断った場合、「すぐに読み取る」では API 側で推奨の別モデルに自動で切り替えて再実行します（`fallbacks: "default"`、対応モデルのみ）。
 バッチではこの仕組みが使えないため、その用紙はエラーになります。確認画面の「AIで再読み取り」で読み直してください。
